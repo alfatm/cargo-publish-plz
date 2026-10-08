@@ -16,6 +16,9 @@ All it needs is `cargo`, `git` and HTTP access to the registry index.
 cargo install cargo-publish-plz
 ```
 
+This installs two equivalent commands: `cargo publish-plz` (a Cargo subcommand) and the shorter
+`publish-plz`. Examples below use the former; `publish-plz update` works the same way.
+
 `publish` relies on multi-package `cargo publish`, available since Cargo 1.90.
 
 ## Typical flow
