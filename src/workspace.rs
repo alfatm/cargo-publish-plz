@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{Dependency, DependencyKind, MetadataCommand};
 use clap::Args;
 use erris::prelude::*;
 use erris::report;
 use semver::Version;
+
+/// Key of the tool's settings in `[package.metadata]` / `[workspace.metadata]`.
+const METADATA_KEY: &str = "publish-plz";
 
 /// Which packages a command operates on, mirroring cargo's own flags.
 #[derive(Args, Debug)]
@@ -29,11 +33,29 @@ pub struct Member {
     pub publish: Option<Vec<String>>,
     pub readme: Option<PathBuf>,
     pub license_file: Option<PathBuf>,
+    /// Effective (workspace-inherited) manifest values, as `cargo metadata` resolves them.
+    pub dependencies: Vec<Dependency>,
+    pub features: BTreeMap<String, Vec<String>>,
+    pub edition: String,
+    pub rust_version: Option<Version>,
+    pub license: Option<String>,
+    /// `[package.metadata.publish-plz] ignore`
+    pub ignore: Option<Vec<String>>,
 }
 
 impl Member {
     pub fn is_publishable(&self) -> bool {
         self.publish.as_ref().is_none_or(|registries| !registries.is_empty())
+    }
+
+    /// Workspace members this package has to be published after: normal and build
+    /// dependencies, and dev-dependencies that keep a version requirement.
+    pub fn publish_deps(&self) -> impl Iterator<Item = &str> {
+        self.dependencies
+            .iter()
+            .filter(|d| d.path.is_some())
+            .filter(|d| d.kind != DependencyKind::Development || d.req.to_string() != "*")
+            .map(|d| d.name.as_str())
     }
 }
 
@@ -41,6 +63,8 @@ pub struct Workspace {
     pub root: PathBuf,
     pub root_manifest: PathBuf,
     pub members: Vec<Member>,
+    /// `[workspace.metadata.publish-plz] ignore`
+    pub ignore: Option<Vec<String>>,
 }
 
 impl Workspace {
@@ -52,29 +76,37 @@ impl Workspace {
         }
         let metadata = cmd.exec().wrap_report("failed to run `cargo metadata`")?;
 
-        let members = metadata
-            .workspace_packages()
-            .into_iter()
-            .map(|p| {
-                let manifest_path = PathBuf::from(&p.manifest_path);
-                let dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_default();
-                Member {
-                    name: p.name.to_string(),
-                    version: p.version.clone(),
-                    readme: p.readme.as_ref().map(|r| dir.join(r)),
-                    license_file: p.license_file.as_ref().map(|l| dir.join(l)),
-                    publish: p.publish.clone(),
-                    manifest_path,
-                    dir,
-                }
-            })
-            .collect();
+        let mut members = Vec::new();
+        for p in metadata.workspace_packages() {
+            let manifest_path = PathBuf::from(&p.manifest_path);
+            let dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let ignore = ignore_patterns(&p.metadata)
+                .wrap_report_with(|| report!("invalid [package.metadata.{METADATA_KEY}] in `{}`", p.name))?;
+            members.push(Member {
+                name: p.name.to_string(),
+                version: p.version.clone(),
+                readme: p.readme.as_ref().map(|r| dir.join(r)),
+                license_file: p.license_file.as_ref().map(|l| dir.join(l)),
+                publish: p.publish.clone(),
+                dependencies: p.dependencies.clone(),
+                features: p.features.clone(),
+                edition: p.edition.as_str().to_owned(),
+                rust_version: p.rust_version.clone(),
+                license: p.license.clone(),
+                ignore,
+                manifest_path,
+                dir,
+            });
+        }
 
+        let ignore = ignore_patterns(&metadata.workspace_metadata)
+            .wrap_report_with(|| report!("invalid [workspace.metadata.{METADATA_KEY}]"))?;
         let root = PathBuf::from(&metadata.workspace_root);
         Ok(Self {
             root_manifest: root.join("Cargo.toml"),
             root,
             members,
+            ignore,
         })
     }
 
@@ -113,6 +145,15 @@ impl Workspace {
 
         Ok(selected.into_iter().filter(|m| m.is_publishable()).collect())
     }
+}
+
+/// `{ "publish-plz": { "ignore": [...] } }` from a `metadata` table.
+fn ignore_patterns(metadata: &serde_json::Value) -> erris::Result<Option<Vec<String>>> {
+    let Some(ignore) = metadata.get(METADATA_KEY).and_then(|m| m.get("ignore")) else {
+        return Ok(None);
+    };
+    let patterns = serde_json::from_value(ignore.clone()).wrap_report("`ignore` must be an array of globs")?;
+    Ok(Some(patterns))
 }
 
 fn nearest_manifest() -> erris::Result<PathBuf> {

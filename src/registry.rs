@@ -4,6 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use erris::prelude::*;
 use erris::report;
@@ -34,116 +35,134 @@ pub struct Registry {
     index: String,
     token: Option<String>,
     agent: ureq::Agent,
-    config: Option<IndexConfig>,
-    versions: HashMap<String, Vec<Version>>,
-    checksums: HashMap<(String, Version), String>,
+    config: IndexConfig,
+    /// name -> (version, checksum) of every published version
+    versions: Mutex<HashMap<String, Vec<(Version, String)>>>,
+}
+
+enum Fetched {
+    Body(Vec<u8>),
+    NotFound,
+    Unauthorized,
 }
 
 impl Registry {
-    fn new(name: String, index: String, token: Option<String>) -> Self {
+    /// Resolves the registry and reads its `config.json`.
+    fn connect(name: String, index: String, token: Option<String>) -> erris::Result<Self> {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
             .build()
             .new_agent();
-        Self {
+        let url = format!("{index}config.json");
+        let mut fetched = fetch(&agent, &url, None)?;
+        if matches!(fetched, Fetched::Unauthorized) {
+            let token = token.as_deref().ok_or_report_with(|| auth_error(&name))?;
+            fetched = fetch(&agent, &url, Some(token))?;
+        }
+        let Fetched::Body(body) = fetched else {
+            return Err(report!("{url}: not found or not authorized"));
+        };
+        let config = serde_json::from_slice(&body).wrap_report_with(|| report!("invalid {url}"))?;
+        Ok(Self {
             name,
             index,
             token,
             agent,
-            config: None,
-            versions: HashMap::new(),
-            checksums: HashMap::new(),
-        }
+            config,
+            versions: Mutex::new(HashMap::new()),
+        })
     }
 
-    fn get(&mut self, url: &str) -> erris::Result<Option<Vec<u8>>> {
-        let auth = self.auth_header()?;
-        let mut request = self.agent.get(url);
-        if let Some(token) = auth {
-            request = request.header("Authorization", token);
-        }
-        let mut response = request.call().wrap_report_with(|| report!("GET {url}"))?;
-        let status = response.status().as_u16();
-        if matches!(status, 404 | 410 | 451) {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            return Err(report!("GET {url}: http status {status}"));
-        }
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_CRATE_SIZE)
-            .read_to_vec()
-            .wrap_report_with(|| report!("GET {url}"))?;
-        Ok(Some(body))
-    }
-
-    fn auth_header(&self) -> erris::Result<Option<String>> {
-        let auth_required = self.config.as_ref().is_some_and(|c| c.auth_required);
-        if !auth_required {
-            return Ok(None);
-        }
-        match &self.token {
-            Some(token) => Ok(Some(token.clone())),
-            None => Err(report!(
-                "registry `{}` requires authentication; set CARGO_REGISTRIES_{}_TOKEN",
-                self.name,
-                env_key(&self.name)
-            )),
-        }
-    }
-
-    fn config(&mut self) -> erris::Result<&IndexConfig> {
-        let cached = self.config.take();
-        let config = match cached {
-            Some(config) => config,
-            None => {
-                let url = format!("{}config.json", self.index);
-                let body = self.get(&url)?.ok_or_report_with(|| report!("{url} not found"))?;
-                serde_json::from_slice(&body).wrap_report_with(|| report!("invalid {url}"))?
-            }
+    fn get(&self, url: &str) -> erris::Result<Option<Vec<u8>>> {
+        let token = if self.config.auth_required {
+            Some(self.token.as_deref().ok_or_report_with(|| auth_error(&self.name))?)
+        } else {
+            None
         };
-        Ok(self.config.insert(config))
+        match fetch(&self.agent, url, token)? {
+            Fetched::Body(body) => Ok(Some(body)),
+            Fetched::NotFound => Ok(None),
+            Fetched::Unauthorized => Err(auth_error(&self.name)),
+        }
+    }
+
+    fn cached(&self, name: &str) -> Option<Vec<(Version, String)>> {
+        let versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        versions.get(name).cloned()
+    }
+
+    fn entries(&self, name: &str) -> erris::Result<Vec<(Version, String)>> {
+        let cached = self.cached(name);
+        if let Some(entries) = cached {
+            return Ok(entries);
+        }
+        let url = format!("{}{}", self.index, index_path(name));
+        let body = self.get(&url)?.unwrap_or_default();
+        let mut entries = Vec::new();
+        for line in body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            let entry: IndexLine =
+                serde_json::from_slice(line).wrap_report_with(|| report!("invalid index entry in {url}"))?;
+            let version = Version::parse(&entry.vers)?;
+            entries.push((version, entry.cksum));
+        }
+        let mut versions = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        versions.insert(name.to_owned(), entries.clone());
+        Ok(entries)
     }
 
     /// All versions of `name` in the index, including yanked ones. Empty if never published.
-    pub fn versions(&mut self, name: &str) -> erris::Result<&[Version]> {
-        if !self.versions.contains_key(name) {
-            self.config()?;
-            let url = format!("{}{}", self.index, index_path(name));
-            let body = self.get(&url)?.unwrap_or_default();
-            let mut versions = Vec::new();
-            for line in body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-                let entry: IndexLine =
-                    serde_json::from_slice(line).wrap_report_with(|| report!("invalid index entry in {url}"))?;
-                let version = Version::parse(&entry.vers)?;
-                self.checksums.insert((name.to_owned(), version.clone()), entry.cksum);
-                versions.push(version);
-            }
-            self.versions.insert(name.to_owned(), versions);
-        }
-        Ok(self.versions.get(name).map_or(&[], Vec::as_slice))
+    pub fn versions(&self, name: &str) -> erris::Result<Vec<Version>> {
+        Ok(self.entries(name)?.into_iter().map(|(version, _)| version).collect())
     }
 
-    pub fn is_published(&mut self, name: &str, version: &Version) -> erris::Result<bool> {
+    pub fn is_published(&self, name: &str, version: &Version) -> erris::Result<bool> {
         Ok(self.versions(name)?.contains(version))
     }
 
     /// Downloads `name@version` and returns its files keyed by path inside the package.
-    pub fn download(&mut self, name: &str, version: &Version) -> erris::Result<BTreeMap<String, Vec<u8>>> {
-        let dl = self.config()?.dl.clone();
-        self.versions(name)?;
-        let checksum = self
-            .checksums
-            .get(&(name.to_owned(), version.clone()))
-            .cloned()
+    pub fn download(&self, name: &str, version: &Version) -> erris::Result<BTreeMap<String, Vec<u8>>> {
+        let entries = self.entries(name)?;
+        let checksum = entries
+            .iter()
+            .find(|(v, _)| v == version)
+            .map(|(_, checksum)| checksum.as_str())
             .unwrap_or_default();
-        let url = download_url(&dl, name, version, &checksum);
+        let url = download_url(&self.config.dl, name, version, checksum);
         let body = self.get(&url)?.ok_or_report_with(|| report!("{url} not found"))?;
         unpack(&body, &format!("{name}-{version}/")).wrap_report_with(|| report!("failed to unpack {url}"))
     }
+}
+
+fn fetch(agent: &ureq::Agent, url: &str, token: Option<&str>) -> erris::Result<Fetched> {
+    let mut request = agent.get(url);
+    if let Some(token) = token {
+        request = request.header("Authorization", token);
+    }
+    let mut response = request.call().wrap_report_with(|| report!("GET {url}"))?;
+    let status = response.status().as_u16();
+    match status {
+        404 | 410 | 451 => return Ok(Fetched::NotFound),
+        401 | 403 => return Ok(Fetched::Unauthorized),
+        _ => {}
+    }
+    if !response.status().is_success() {
+        return Err(report!("GET {url}: http status {status}"));
+    }
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_CRATE_SIZE)
+        .read_to_vec()
+        .wrap_report_with(|| report!("GET {url}"))?;
+    Ok(Fetched::Body(body))
+}
+
+fn auth_error(registry: &str) -> Report {
+    report!(
+        "registry `{registry}` requires authentication; set CARGO_REGISTRIES_{}_TOKEN",
+        env_key(registry)
+    )
 }
 
 fn unpack(crate_file: &[u8], prefix: &str) -> erris::Result<BTreeMap<String, Vec<u8>>> {
@@ -302,7 +321,8 @@ impl Registries {
         Ok(Some(default.unwrap_or_else(|| CRATES_IO.to_owned())))
     }
 
-    pub fn get(&mut self, name: &str) -> erris::Result<&mut Registry> {
+    /// Resolves a registry once; later lookups go through [`Registries::get`].
+    pub fn connect(&mut self, name: &str) -> erris::Result<&Registry> {
         match self.registries.entry(name.to_owned()) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
@@ -312,9 +332,15 @@ impl Registries {
         }
     }
 
+    pub fn get(&self, name: &str) -> erris::Result<&Registry> {
+        self.registries
+            .get(name)
+            .ok_or_report_with(|| report!("registry `{name}` is not connected"))
+    }
+
     fn resolve(config: &CargoConfig, name: &str) -> erris::Result<Registry> {
         if name == CRATES_IO {
-            return Ok(Registry::new(name.to_owned(), CRATES_IO_INDEX.to_owned(), None));
+            return Registry::connect(name.to_owned(), CRATES_IO_INDEX.to_owned(), None);
         }
         let env = format!("CARGO_REGISTRIES_{}_INDEX", env_key(name));
         let Some(index) = config.get(&env, &["registries", name, "index"]) else {
@@ -328,7 +354,7 @@ impl Registries {
             ));
         };
         let index = format!("{}/", index.trim_end_matches('/'));
-        Ok(Registry::new(name.to_owned(), index, config.token(name)))
+        Registry::connect(name.to_owned(), index, config.token(name))
     }
 }
 
