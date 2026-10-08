@@ -3,9 +3,12 @@
 //! The logic lives here so that both binaries, `cargo-publish-plz` (run by cargo as
 //! `cargo publish-plz`) and `publish-plz`, share it.
 
+mod checkout;
 mod commits;
 mod effective;
+mod git;
 mod ignore;
+mod interrupt;
 mod manifest;
 mod parallel;
 mod publish;
@@ -59,6 +62,7 @@ pub fn main() -> ExitCode {
     let matches = Cli::command().bin_name(bin_name).get_matches_from(args);
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
 
+    interrupt::install();
     let result = match cli.command {
         Command::Update(args) => update::run(&args),
         Command::Check(args) => update::check(&args),

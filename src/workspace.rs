@@ -11,7 +11,7 @@ use semver::Version;
 const METADATA_KEY: &str = "publish-plz";
 
 /// Which packages a command operates on, mirroring cargo's own flags.
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct Selection {
     /// Path to Cargo.toml.
     #[arg(long, value_name = "PATH")]
@@ -156,7 +156,7 @@ fn ignore_patterns(metadata: &serde_json::Value) -> erris::Result<Option<Vec<Str
     Ok(Some(patterns))
 }
 
-fn nearest_manifest() -> erris::Result<PathBuf> {
+pub fn nearest_manifest() -> erris::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     cwd.ancestors()
         .map(|dir| dir.join("Cargo.toml"))

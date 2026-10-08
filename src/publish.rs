@@ -83,7 +83,7 @@ struct Pending {
 pub fn run(args: &PublishArgs) -> erris::Result<ExitCode> {
     let ws = Workspace::load(&args.selection)?;
     let selected = ws.select(&args.selection)?;
-    let mut registries = Registries::new(&ws.root);
+    let mut registries = Registries::new(&std::env::current_dir()?);
 
     let mut targets = Vec::new();
     for member in &selected {

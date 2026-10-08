@@ -31,25 +31,16 @@ cargo publish-plz publish     # publish everything that isn't published yet
 
 In CI, `cargo publish-plz check` on merge requests catches a forgotten `update`.
 
-## `cargo publish-plz update`
+## How it works
 
-For every publishable package (`publish != false`):
+The registry is the source of truth: there are no tags or state files. For every publishable package:
 
-1. **Registry status.** The registry index is queried:
-   - the crate was never published: nothing to bump, it will be published as is;
-   - the local version is not in the registry: the crate was already bumped and is waiting for `publish`;
-   - the local version is published: continue.
-2. **Change detection.** The published `.crate` is downloaded and compared with the local package:
-   - file by file with what `cargo package --list` would pack now, skipping
-     [ignored files](#ignored-files) (`*.md` by default);
-   - `Cargo.toml.orig` against the local `Cargo.toml`;
-   - if the member's own `Cargo.toml` is the same, what it **inherits from the workspace**:
-     dependency versions and features (`serde.workspace = true` with a new `serde` version in the root
-     `[workspace.dependencies]`), `[features]`, `edition`, `rust-version`, `license`.
-3. **Bump level.** The commit the crate was published from is read from `.cargo_vcs_info.json`.
-   Commits since then that touch the package directory are parsed as
-   [Conventional Commits](https://www.conventionalcommits.org/); commits that only change ignored
-   files don't count.
+1. **Compare with the release.** The published `.crate` of the local version is downloaded and compared
+   with what `cargo package` would pack now, file by file, plus what the manifest inherits from the
+   workspace (dependency versions, features, edition, …). Equal means unchanged.
+2. **Pick the bump.** The commit the release was packaged from is in its `.cargo_vcs_info.json`. The
+   commits since then that touch the package are read as
+   [Conventional Commits](https://www.conventionalcommits.org/):
 
    | Current version | Breaking (`feat!:`, `BREAKING CHANGE:`) | `feat:`   | anything else |
    |-----------------|-----------------------------------------|-----------|---------------|
@@ -57,21 +48,15 @@ For every publishable package (`publish != false`):
    | `>= 1.0.0`      | major                                   | minor     | patch         |
    | `x.y.z-pre.N`   | `pre.N+1`                               | `pre.N+1` | `pre.N+1`     |
 
-   In a shallow clone (the default in most CI) the source commit is usually missing: the history
-   is fetched once with `git fetch --unshallow` (disable with `--no-fetch`). If the commit is still
-   unknown, the bump is a patch.
-4. **Dependents.** Workspace members depending on a bumped crate get their version requirement
-   updated and a patch bump, transitively. This covers `[dependencies]`, `[build-dependencies]`,
-   `[target.*.dependencies]` and `[workspace.dependencies]`. A `[dev-dependencies]` requirement is
-   updated only when it no longer matches the new version.
-5. **Shared version.** Members with `version.workspace = true` are bumped together, to the highest
-   version among their bumps; `[workspace.package] version` is updated.
-6. **Write.** Manifests are edited in place, keeping formatting and comments, then
+3. **Propagate.** Members depending on a bumped crate get their requirement updated and a patch bump,
+   transitively. Members sharing `workspace.package.version` move together.
+4. **Write.** Manifests are edited in place, keeping formatting and comments, then
    `cargo update --workspace` refreshes `Cargo.lock`.
 
-Registry lookups, downloads and comparisons run in parallel.
-
-Example:
+A package whose local version is below the newest release made from this history is `behind` and left
+alone: the repository doesn't keep the version, or the checkout is old. One whose next version was already
+released from another history is `version-taken` and fails `check`. These and the other edge cases
+(backports, pre-releases, shallow clones, …) are explained in [docs/design.md](docs/design.md).
 
 ```text
 $ cargo publish-plz update
@@ -80,7 +65,7 @@ release_plz_core: 0.38.7 -> 0.38.8 (dependency `git_cmd` updated)
   crates/release_plz_core/Cargo.toml: `git_cmd` 0.8.0 -> 0.9.0
 ```
 
-### Explicit versions
+## `cargo publish-plz update`
 
 `--bump` and `--version` skip change detection for the selected packages and bump them anyway;
 dependents are still updated as usual.
@@ -90,32 +75,35 @@ cargo publish-plz update -p my-crate --bump minor     # 0.3.2 -> 0.4.0
 cargo publish-plz update -p my-crate --version 1.0.0
 ```
 
-`--bump` is applied literally (`major` on `0.3.2` gives `1.0.0`); a pre-release already at that level
-is released as is (`patch` on `1.0.0-rc.1` gives `1.0.0`). The new version must be greater than the
-current one.
-
-### Options
-
-| Option                   | Description                                                      |
-|--------------------------|------------------------------------------------------------------|
-| `--dry-run`              | Print what would change without writing anything                 |
-| `--bump <LEVEL>`         | Bump the selected packages by `patch`, `minor` or `major`        |
-| `--version <VERSION>`    | Set the selected packages to this version                        |
-| `--ignore <GLOB>`        | Also ignore changes in matching files (repeatable)               |
-| `--all`                  | Count changes in all files, ignoring nothing                     |
-| `--no-fetch`             | Don't fetch git history in shallow clones                        |
-| `--format <FORMAT>`      | `human` (default) or `json`                                      |
-| `-p, --package <SPEC>`   | Only check these packages (dependents are still bumped)          |
-| `--workspace`            | Check all workspace members                                      |
-| `--manifest-path <PATH>` | Path to `Cargo.toml`                                             |
-| `--registry <NAME>`      | Only check packages allowed to go to this registry               |
+| Option                   | Description                                               |
+|--------------------------|-----------------------------------------------------------|
+| `--dry-run`              | Print what would change without writing anything          |
+| `--bump <LEVEL>`         | Bump the selected packages by `patch`, `minor` or `major` |
+| `--version <VERSION>`    | Set the selected packages to this version                 |
+| `--ignore <GLOB>`        | Also ignore changes in matching files (repeatable)        |
+| `--all`                  | Count changes in all files, ignoring nothing              |
+| `--no-fetch`             | Don't fetch git history in shallow clones                 |
+| `--format <FORMAT>`      | `human` (default) or `json`                               |
+| `-p, --package <SPEC>`   | Only check these packages (dependents are still bumped)   |
+| `--workspace`            | Check all workspace members                               |
+| `--manifest-path <PATH>` | Path to `Cargo.toml`                                      |
+| `--registry <NAME>`      | Only check packages allowed to go to this registry        |
 
 ## `cargo publish-plz check`
 
-Runs the same detection as `update` without writing anything, prints what `update` would do and
-exits with code 1 if any package changed without a version bump. Packages already bumped and waiting
-for `publish` are fine. Takes the same options as `update` except `--dry-run`, `--bump` and
-`--version`.
+The same detection as `update`, without writing anything. Exits with 1 if a package changed without a
+version bump, its next version is already taken, or it can go to several registries and no `--registry`
+picks one. Packages already bumped and waiting for `publish` are fine. Takes the options of `update`
+except `--dry-run`, `--bump` and `--version`.
+
+`--rev <REV>` checks the committed state of a revision instead of the working tree. It is checked out
+into a temporary `git worktree`, with its submodules and without running the repository's hooks, and
+removed afterwards; see [docs/design.md](docs/design.md#checking-a-revision).
+
+```sh
+cargo publish-plz check --workspace --rev HEAD
+cargo publish-plz check -p my-crate --rev origin/main
+```
 
 ```yaml
 # .gitlab-ci.yml
@@ -125,14 +113,10 @@ release-check:
 
 ## `cargo publish-plz publish`
 
-- Packages that are already published at their current version are skipped with a warning, not an error,
-  so the command can be safely re-run after a partial failure.
-- The rest is published with `cargo publish -p a -p b ...`; Cargo orders the packages and waits for
-  each one to appear in the index before publishing its dependents.
-- Packages going to different registries are split into several `cargo publish` calls, ordered by
-  their dependencies: with `base` (registry A) ← `mid` (registry B) ← `top` (registry A) the calls
-  are `A: base`, `B: mid`, `A: top`. With `--dry-run`, calls depending on packages of an earlier call
-  are skipped, since those packages were not uploaded.
+Publishes every package whose current version is not in its registry with `cargo publish -p a -p b ...`;
+Cargo orders the packages and waits for each one to appear in the index before its dependents. Packages
+already published are skipped, so the command can be re-run after a partial failure. Packages going to
+different registries are split into calls ordered by their dependencies.
 
 | Option                   | Description                                          |
 |--------------------------|------------------------------------------------------|
@@ -166,26 +150,24 @@ ignore = ["*.md", "benches/**"]
 
 ## Package selection
 
-All commands pick packages the same way `cargo publish` does: `-p` and `--workspace` win; otherwise
-running inside a member directory selects that member, and running at the workspace root selects all
-members. Packages with `publish = false` are always skipped.
+All commands pick packages the way `cargo publish` does: `-p` and `--workspace` win; otherwise running
+inside a member directory selects that member, and running at the workspace root selects all members.
+Packages with `publish = false` are always skipped.
 
 ## Registries
 
 Each package goes to the registry `cargo publish` would pick for it, honouring `package.publish`
 (including `publish.workspace = true`):
 
-| `package.publish`          | without `--registry`                       | with `--registry X`             |
-|----------------------------|--------------------------------------------|---------------------------------|
-| `false`                    | skipped                                    | skipped                         |
-| unset / `true`             | `registry.default`, else crates.io         | `X`                             |
-| `["Y"]`                    | `Y`                                        | `X` if `X == Y`, else skipped   |
-| `["Y", "Z"]`               | error: pass `--registry`                   | `X` if listed, else skipped     |
+| `package.publish` | without `--registry`                                     | with `--registry X`           |
+|-------------------|----------------------------------------------------------|-------------------------------|
+| `false`           | skipped                                                  | skipped                       |
+| unset / `true`    | `registry.default`, else crates.io                       | `X`                           |
+| `["Y"]`           | `Y`                                                      | `X` if `X == Y`, else skipped |
+| `["Y", "Z"]`      | error: pass `--registry` (`check`: `ambiguous-registry`) | `X` if listed, else skipped   |
 
-Skipped packages are reported with a warning. Every `cargo publish` call gets an explicit
-`--registry`. `update` and `check` use the same rules to choose the registry they compare against.
-
-Registries other than crates.io are read from Cargo configuration:
+`update` and `check` compare against the same registry. Registries other than crates.io are read from
+Cargo configuration, looked up from the current directory as cargo does:
 
 ```toml
 # .cargo/config.toml
@@ -198,9 +180,7 @@ taken from `CARGO_REGISTRIES_<NAME>_TOKEN` or `$CARGO_HOME/credentials.toml`.
 
 ## JSON output
 
-With `--format json` the result goes to stdout as JSON; progress and warnings stay on stderr.
-
-`update` and `check`:
+With `--format json` the result goes to stdout; progress and warnings stay on stderr.
 
 ```json
 {
@@ -210,10 +190,13 @@ With `--format json` the result goes to stdout as JSON; progress and warnings st
       "version": "0.8.0",
       "status": "published",
       "registry": "crates-io",
-      "inherited_changes": ["dependency `camino`"],
+      "latest": "0.8.0",
+      "published_sha": "3c1f0e2d9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+      "changed_files": ["src/lib.rs"],
+      "commits": [{ "sha": "9e8f7a6b5c4d3c1f0e2d9a8b7c6d5e4f3a2b1c0d", "subject": "fix: retry on EINTR" }],
       "next_version": "0.8.1",
       "bump": "fix",
-      "reason": "fix: inherited dependency `camino` changed, 0 commits"
+      "reason": "fix: `src/lib.rs` changed, 1 commit"
     }
   ],
   "requirements": [
@@ -223,14 +206,9 @@ With `--format json` the result goes to stdout as JSON; progress and warnings st
 }
 ```
 
-- `status`: `new`, `pending` (bumped, not published yet), `published` or `not-allowed`;
-- `changed_files` / `inherited_changes`: why a package changed;
-- `next_version`, `bump` (`fix`, `feat`, `breaking`, `patch`/`minor`/`major`, `=VERSION`, `workspace`)
-  and `reason` are present for packages that get a new version;
-- `check` has `"ok": true|false` instead of `dry_run`.
-
-`publish`: `packages[].outcome` is `published`, `dry-run`, `not-run`, `already-published` or
-`not-allowed`, and `batches` lists the `cargo publish` calls.
+`status` is one of `new`, `pending`, `published`, `behind`, `version-taken`, `not-allowed` and
+`ambiguous-registry`; `check` has `"ok": true|false` instead of `dry_run`. Every field is described in
+[docs/design.md](docs/design.md#json-output).
 
 ## Limitations
 
