@@ -1,6 +1,6 @@
 [package]
 name = "cargo-publish-plz"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 authors = ["Andrew Panin <alfatm@gmail.com>"]
 description = "Bump versions of changed workspace crates and publish unpublished ones, without forge integration"
