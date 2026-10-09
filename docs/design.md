@@ -25,6 +25,11 @@ Every publishable package (`publish != false`) is first looked up in the index o
 
 Yanked versions count as published (they can't be published again) but never as the newest release.
 
+A `new` package is not looked up in git, even when it is only used as a git dependency in practice: a package
+being prepared for its first release would otherwise be bumped past a version nobody has seen (`0.1.0` committed,
+a few commits more, `0.1.1`). `publish` unset means the registry is where its releases go; a package released
+through git says so with `publish = false`, and `update` suggests it for every `new` one.
+
 Packages with `publish = false` are looked up in git instead ([Unpublished packages](#unpublished-packages)),
 and ones with `update = false` in neither:
 

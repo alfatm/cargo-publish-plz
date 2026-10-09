@@ -160,7 +160,10 @@ inside a member directory selects that member, and running at the workspace root
 ## Unpublished packages
 
 A package with `publish = false` never reaches a registry, but it can still be used as a git dependency, and
-cargo checks the `version` requirement of a git dependency against it. `update` and `check` bump it like any
+cargo checks the `version` requirement of a git dependency against it. Without `publish = false` a package is
+publishable, as cargo has it: one never published waits for its first `publish`, which releases the local version
+as is, so it is not bumped however much it changes. A package that is only used through git needs
+`publish = false` to be bumped. `update` and `check` bump it like any
 other, with git in place of the registry: its release is the commit that set its current version (the newest
 commit touching its `Cargo.toml`, or the workspace one for `version.workspace = true`, after which the
 version is the current one). Files that differ from that commit, committed or not, make it changed; the

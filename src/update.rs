@@ -612,7 +612,11 @@ fn plan(
         let id = format!("{}@{}", member.name, member.version);
         match status_of.get(member.name.as_str()) {
             _ if bumps.contains_key(&member.name) => {}
-            Some(Status::New) if member.is_publishable() => eprintln!("{id}: never published, nothing to bump"),
+            Some(Status::New) if member.is_publishable() => eprintln!(
+                "{id}: never published: the first `publish` releases {} as is, nothing to bump; if it is only used \
+                 through git, set `publish = false` to bump it through git",
+                member.version
+            ),
             Some(Status::New) => eprintln!("{id}: not committed yet, nothing to bump"),
             Some(Status::Pending) if member.is_publishable() => eprintln!("{id}: not published yet, nothing to bump"),
             Some(Status::Pending) => eprintln!("{id}: the version is not committed yet, nothing to bump"),
