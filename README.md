@@ -53,6 +53,9 @@ The registry is the source of truth: there are no tags or state files. For every
 4. **Write.** Manifests are edited in place, keeping formatting and comments, then
    `cargo update --workspace` refreshes `Cargo.lock`.
 
+Packages with `publish = false` are bumped the same way, but their release is the commit that set the
+local version: see [Unpublished packages](#unpublished-packages).
+
 A package whose local version is below the newest release made from this history is `behind` and left
 alone: the repository doesn't keep the version, or the checkout is old. One whose next version was already
 released from another history is `version-taken` and fails `check`. These and the other edge cases
@@ -152,7 +155,33 @@ ignore = ["*.md", "benches/**"]
 
 All commands pick packages the way `cargo publish` does: `-p` and `--workspace` win; otherwise running
 inside a member directory selects that member, and running at the workspace root selects all members.
-Packages with `publish = false` are always skipped.
+`publish` skips packages with `publish = false`, with a warning.
+
+## Unpublished packages
+
+A package with `publish = false` never reaches a registry, but it can still be used as a git dependency, and
+cargo checks the `version` requirement of a git dependency against it. `update` and `check` bump it like any
+other, with git in place of the registry: its release is the commit that set its current version (the newest
+commit touching its `Cargo.toml`, or the workspace one for `version.workspace = true`, after which the
+version is the current one). Files that differ from that commit, committed or not, make it changed; the
+commits since pick the bump; it takes part in propagation. When that commit can't be found (no git
+repository, a shallow clone that can't be deepened) a selected package is an error.
+
+`update = false` leaves a package's version alone, published or not; `update` and `check` warn about it
+instead, saying which dependency was updated under it, if any. It is `true` by default:
+
+```toml
+# Cargo.toml of the workspace: the default for every package
+[workspace.metadata.publish-plz]
+update = false
+
+# Cargo.toml of a package: overrides the workspace
+[package.metadata.publish-plz]
+update = true
+```
+
+A package with `update = false` that shares the workspace version still moves with it, with a warning. A
+`publish = false` package without `version` (cargo takes `0.0.0`) is `unversioned` and never bumped.
 
 ## Registries
 
@@ -206,8 +235,8 @@ With `--format json` the result goes to stdout; progress and warnings stay on st
 }
 ```
 
-`status` is one of `new`, `pending`, `published`, `behind`, `version-taken`, `not-allowed` and
-`ambiguous-registry`; `check` has `"ok": true|false` instead of `dry_run`. Every field is described in
+`status` is one of `new`, `pending`, `published`, `committed`, `disabled`, `unversioned`, `behind`,
+`version-taken`, `not-allowed` and `ambiguous-registry`; `check` has `"ok": true|false` instead of `dry_run`. Every field is described in
 [docs/design.md](docs/design.md#json-output).
 
 ## Limitations

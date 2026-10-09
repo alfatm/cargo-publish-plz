@@ -7,6 +7,7 @@ mod checkout;
 mod commits;
 mod effective;
 mod git;
+mod git_release;
 mod ignore;
 mod interrupt;
 mod manifest;

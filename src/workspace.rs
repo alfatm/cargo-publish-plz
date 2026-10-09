@@ -41,6 +41,8 @@ pub struct Member {
     pub license: Option<String>,
     /// `[package.metadata.publish-plz] ignore`
     pub ignore: Option<Vec<String>>,
+    /// `[package.metadata.publish-plz] update`
+    pub update: Option<bool>,
 }
 
 impl Member {
@@ -65,6 +67,8 @@ pub struct Workspace {
     pub members: Vec<Member>,
     /// `[workspace.metadata.publish-plz] ignore`
     pub ignore: Option<Vec<String>>,
+    /// `[workspace.metadata.publish-plz] update`
+    pub update: Option<bool>,
 }
 
 impl Workspace {
@@ -80,7 +84,7 @@ impl Workspace {
         for p in metadata.workspace_packages() {
             let manifest_path = PathBuf::from(&p.manifest_path);
             let dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_default();
-            let ignore = ignore_patterns(&p.metadata)
+            let settings = Settings::parse(&p.metadata)
                 .wrap_report_with(|| report!("invalid [package.metadata.{METADATA_KEY}] in `{}`", p.name))?;
             members.push(Member {
                 name: p.name.to_string(),
@@ -93,20 +97,22 @@ impl Workspace {
                 edition: p.edition.as_str().to_owned(),
                 rust_version: p.rust_version.clone(),
                 license: p.license.clone(),
-                ignore,
+                ignore: settings.ignore,
+                update: settings.update,
                 manifest_path,
                 dir,
             });
         }
 
-        let ignore = ignore_patterns(&metadata.workspace_metadata)
+        let settings = Settings::parse(&metadata.workspace_metadata)
             .wrap_report_with(|| report!("invalid [workspace.metadata.{METADATA_KEY}]"))?;
         let root = PathBuf::from(&metadata.workspace_root);
         Ok(Self {
             root_manifest: root.join("Cargo.toml"),
             root,
             members,
-            ignore,
+            ignore: settings.ignore,
+            update: settings.update,
         })
     }
 
@@ -114,8 +120,13 @@ impl Workspace {
         self.members.iter().find(|m| m.name == name)
     }
 
-    /// Publishable packages picked by `-p` / `--workspace` / the current directory,
-    /// the same way `cargo publish` would pick them.
+    /// Whether `update` bumps the member: its `update`, else the workspace's, else yes.
+    pub fn updates(&self, member: &Member) -> bool {
+        member.update.or(self.update).unwrap_or(true)
+    }
+
+    /// Packages picked by `-p` / `--workspace` / the current directory, the same way `cargo publish`
+    /// would pick them, `publish = false` ones included.
     pub fn select(&self, selection: &Selection) -> erris::Result<Vec<&Member>> {
         let selected: Vec<&Member> = if !selection.packages.is_empty() {
             let mut picked = Vec::new();
@@ -143,17 +154,38 @@ impl Workspace {
             }
         };
 
-        Ok(selected.into_iter().filter(|m| m.is_publishable()).collect())
+        Ok(selected)
     }
 }
 
-/// `{ "publish-plz": { "ignore": [...] } }` from a `metadata` table.
-fn ignore_patterns(metadata: &serde_json::Value) -> erris::Result<Option<Vec<String>>> {
-    let Some(ignore) = metadata.get(METADATA_KEY).and_then(|m| m.get("ignore")) else {
-        return Ok(None);
-    };
-    let patterns = serde_json::from_value(ignore.clone()).wrap_report("`ignore` must be an array of globs")?;
-    Ok(Some(patterns))
+/// `{ "publish-plz": { "ignore": [...], "update": true } }` from a `metadata` table.
+#[derive(Debug, Default, PartialEq)]
+struct Settings {
+    ignore: Option<Vec<String>>,
+    update: Option<bool>,
+}
+
+impl Settings {
+    fn parse(metadata: &serde_json::Value) -> erris::Result<Self> {
+        let Some(table) = metadata.get(METADATA_KEY) else {
+            return Ok(Self::default());
+        };
+        let ignore = match table.get("ignore") {
+            Some(ignore) => {
+                Some(serde_json::from_value(ignore.clone()).wrap_report("`ignore` must be an array of globs")?)
+            }
+            None => None,
+        };
+        // `update = "false"` reads as meant, not as a type error.
+        let update = match table.get("update") {
+            None => None,
+            Some(serde_json::Value::Bool(update)) => Some(*update),
+            Some(serde_json::Value::String(update)) if update == "true" => Some(true),
+            Some(serde_json::Value::String(update)) if update == "false" => Some(false),
+            Some(_) => return Err(report!("`update` must be true or false")),
+        };
+        Ok(Self { ignore, update })
+    }
 }
 
 pub fn nearest_manifest() -> erris::Result<PathBuf> {
@@ -166,4 +198,27 @@ pub fn nearest_manifest() -> erris::Result<PathBuf> {
 
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> erris::Result<Settings> {
+        Settings::parse(&serde_json::from_str(json)?)
+    }
+
+    #[test]
+    fn reads_settings() -> erris::Result<()> {
+        assert_eq!(parse("null")?, Settings::default());
+        assert_eq!(parse(r#"{"other": {"update": false}}"#)?, Settings::default());
+        let settings = parse(r#"{"publish-plz": {"ignore": ["*.md"], "update": false}}"#)?;
+        assert_eq!(settings.ignore, Some(vec!["*.md".to_owned()]));
+        assert_eq!(settings.update, Some(false));
+        assert_eq!(parse(r#"{"publish-plz": {"update": "true"}}"#)?.update, Some(true));
+        assert_eq!(parse(r#"{"publish-plz": {"update": "false"}}"#)?.update, Some(false));
+        assert!(parse(r#"{"publish-plz": {"update": "no"}}"#).is_err());
+        assert!(parse(r#"{"publish-plz": {"ignore": "*.md"}}"#).is_err());
+        Ok(())
+    }
 }

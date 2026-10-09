@@ -5,7 +5,8 @@ has the overview; this file has the reasons.
 
 The registry is the only source of truth. There are no tags, release commits or state files to keep in sync:
 what was released is whatever the registry has, and where it came from is the `.cargo_vcs_info.json` cargo
-packs into every `.crate`.
+packs into every `.crate`. Packages that are never published have git instead: the commit that set the version
+([Unpublished packages](#unpublished-packages)).
 
 ## Registry status
 
@@ -23,6 +24,17 @@ Every publishable package (`publish != false`) is first looked up in the index o
 | `ambiguous-registry` | `package.publish` lists several registries, no `--registry` picks one | skipped, fails      |
 
 Yanked versions count as published (they can't be published again) but never as the newest release.
+
+Packages with `publish = false` are looked up in git instead ([Unpublished packages](#unpublished-packages)),
+and ones with `update = false` in neither:
+
+| Status        | When                                                      | Then       |
+|---------------|-----------------------------------------------------------|------------|
+| `new`         | `publish = false`, `HEAD` has no such package             | left alone |
+| `pending`     | `publish = false`, `HEAD` has another version             | left alone |
+| `committed`   | `publish = false`, `HEAD` has the local version           | compared   |
+| `disabled`    | `update = false`                                          | warned     |
+| `unversioned` | `publish = false` without `version` (cargo takes `0.0.0`) | left alone |
 
 ### Behind: the version is not kept in the repository
 
@@ -111,17 +123,51 @@ released as is (`patch` on `1.0.0-rc.1` gives `1.0.0`). The new version must be 
 Members depending on a bumped crate get their version requirement updated and a patch bump, transitively.
 This covers `[dependencies]`, `[build-dependencies]`, `[target.*.dependencies]` and
 `[workspace.dependencies]`. A `[dev-dependencies]` requirement is updated only when it no longer matches the
-new version, since dev-dependencies don't reach users. Only `published` members are bumped by propagation.
+new version, since dev-dependencies don't reach users. Only `published` and `committed` members are bumped by
+propagation.
 
 Members with `version.workspace = true` are bumped together, to the highest version among their bumps, and
 `[workspace.package] version` is updated.
+
+## Unpublished packages
+
+A `publish = false` package can be a git dependency of another repository, and cargo checks the `version` of a
+git dependency against the requirement, so a breaking change under the same version breaks its users quietly.
+It is bumped like a published one, with git as the record of releases: a version is released by the commit that
+set it.
+
+That commit is the newest one touching the package's `Cargo.toml` (and the workspace one, when the package takes
+`version.workspace = true`) whose first parent has another version of the package, or none (the package was
+added, renamed or moved there). In history, a manifest without `version` has cargo's `0.0.0`. The version is compared at
+`HEAD` first: a package `HEAD` doesn't have is `new`, and one whose version differs from `HEAD`'s is `pending`
+(the bump is not committed yet), so running `update` twice doesn't bump twice.
+
+A `committed` package changed when its files differ from the release commit: `git diff` against it plus
+untracked files, in the package directory without nested members, [ignored files](../README.md#ignored-files)
+left out. What it inherits from the workspace is not compared, short of the version requirements on bumped
+members, which propagation covers. The bump level comes from the commits since, as for a published package,
+and propagation goes through `committed` packages as through `published` ones.
+
+A selected package whose release commit can't be found is an error, never a guess: outside a git repository,
+or beyond a shallow clone's history that `--no-fetch` keeps from being fetched. A package that is not
+selected and only there for propagation is taken as released outside a git repository.
+
+### `update = false`
+
+`[package.metadata.publish-plz] update = false` (default `[workspace.metadata.publish-plz] update`, else
+`true`) leaves the version alone whatever changed, published or not, `--bump` and `--version` included. The
+package is not compared, propagation doesn't go through it, and `update` / `check` warn instead: about every
+selected one, and about any other whose requirement on a bumped member is rewritten. The requirement is still
+rewritten, or the workspace wouldn't build. A package sharing the workspace version moves with it all the same,
+with a warning: the version is one field.
 
 ## Shallow clones
 
 CI usually clones with `--depth`. The commits releases were made from are then missing, or present (as the tip
 of another branch fetched with `--no-single-branch`) but cut off from `HEAD` by the shallow boundary, so
 `git merge-base --is-ancestor` says no although the answer is yes. Whenever a relation to `HEAD` isn't found in
-a shallow clone, the full history is fetched once with `git fetch --unshallow`, and only the commits not found
+a shallow clone, or the commit that set an [unpublished package's](#unpublished-packages) version is beyond
+it, the full history is fetched once with `git fetch --unshallow`, and only the commits not found
 are asked again. `--no-fetch` disables this; relations a shallow clone can't show then count as unknown.
 
 `is_shallow` runs once per run, the ancestry of each commit once (again only after a real fetch), and the
@@ -218,7 +264,8 @@ packages were not uploaded.
 - `name`, `version`, `status` (see [Registry status](#registry-status)), `registry`;
 - `registries`: for `ambiguous-registry`, the registries `package.publish` allows (selected packages only);
 - `latest`: the newest published version that is not yanked;
-- `published_sha`: for a `published` package, the commit its version was packaged from;
+- `published_sha`: for a `published` package, the commit its version was packaged from; for a `committed` one,
+  the commit that set its version;
 - `changed_files` / `inherited_changes`: why a package changed;
 - `commits`: the commits since `published_sha` that touch the package and count for the bump, newest first;
 - `next_version`, `bump` (`fix`, `feat`, `breaking`, `patch`/`minor`/`major`, `=VERSION`, `workspace`) and
@@ -229,5 +276,6 @@ packages were not uploaded.
 `requirements` lists the requirement edits, `dry_run` says whether `update` wrote anything, and `check` has
 `"ok": true|false` instead.
 
-`publish`: `packages[].outcome` is `published`, `dry-run`, `not-run`, `already-published` or `not-allowed`,
+`publish`: `packages[].outcome` is `published`, `dry-run`, `not-run`, `already-published`, `not-allowed` or
+`not-publishable` (`publish = false`),
 and `batches` lists the `cargo publish` calls.

@@ -31,6 +31,17 @@ pub fn toplevel(dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(top.trim()))
 }
 
+/// `dir` relative to `repo`, both canonicalized (only for comparing; git is given paths as it prints them).
+pub fn relative_to(repo: &Path, dir: &Path) -> PathBuf {
+    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    match dir.strip_prefix(&repo) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => dir,
+    }
+}
+
 /// The working tree `repo` is a submodule of.
 pub fn superproject(repo: &Path) -> Option<PathBuf> {
     let top = run(repo, &["rev-parse", "--show-superproject-working-tree"]).ok()?;

@@ -46,6 +46,8 @@ enum Outcome {
     NotRun,
     AlreadyPublished,
     NotAllowed,
+    /// `publish = false`.
+    NotPublishable,
 }
 
 #[derive(Serialize)]
@@ -85,8 +87,22 @@ pub fn run(args: &PublishArgs) -> erris::Result<ExitCode> {
     let selected = ws.select(&args.selection)?;
     let mut registries = Registries::new(&std::env::current_dir()?);
 
+    let mut reports = Vec::new();
     let mut targets = Vec::new();
     for member in &selected {
+        if !member.is_publishable() {
+            eprintln!(
+                "warning: {}@{}: `publish = false`, skipping",
+                member.name, member.version
+            );
+            reports.push(PackageReport {
+                name: member.name.clone(),
+                version: member.version.to_string(),
+                registry: None,
+                outcome: Outcome::NotPublishable,
+            });
+            continue;
+        }
         let registry = registries.name_for(args.registry.as_deref(), &member.name, member.publish.as_deref())?;
         if let Some(registry) = &registry {
             registries.connect(registry)?;
@@ -99,7 +115,6 @@ pub fn run(args: &PublishArgs) -> erris::Result<ExitCode> {
         None => Ok(false),
     });
 
-    let mut reports = Vec::new();
     let mut pending = Vec::new();
     for ((member, registry), published) in targets.iter().zip(published) {
         let published = published?;

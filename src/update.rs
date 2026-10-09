@@ -14,6 +14,7 @@ use crate::checkout::Checkout;
 use crate::commits::{self, Change, Level};
 use crate::effective::Effective;
 use crate::git;
+use crate::git_release::{self, Pathspec, Release};
 use crate::ignore::{self, Ignore};
 use crate::manifest::{Manifests, needs_req_update};
 use crate::parallel;
@@ -77,12 +78,19 @@ pub struct CheckArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Status {
-    /// The crate was never published.
+    /// The crate was never published. `publish = false`: `HEAD` has no such package.
     New,
-    /// The crate exists, but not with the local version: it is waiting for `publish`.
+    /// The crate exists, but not with the local version: it is waiting for `publish`. `publish = false`: `HEAD` has
+    /// another version, the bump is not committed yet.
     Pending,
     /// The local version is published.
     Published,
+    /// `publish = false`: the local version is in `HEAD`, released through git by the commit that set it.
+    Committed,
+    /// `update = false`: never bumped.
+    Disabled,
+    /// `publish = false` without `version`: nothing to bump.
+    Unversioned,
     /// `package.publish` doesn't allow the selected registry.
     NotAllowed,
     /// The local version is below the newest published one, which was released from this history (the version is
@@ -95,6 +103,13 @@ enum Status {
     /// published, from a commit neither in this history nor after it: another branch, or one not fetched. Not bumped;
     /// fails `check`.
     VersionTaken,
+}
+
+impl Status {
+    /// The version is out: a change needs a new one.
+    fn is_released(self) -> bool {
+        matches!(self, Status::Published | Status::Committed)
+    }
 }
 
 /// Where a package stands against its registry's versions, [`Status::Behind`] aside.
@@ -139,12 +154,12 @@ struct Bump {
     reason: String,
 }
 
-/// Result of comparing a package with its published `.crate`.
+/// Result of comparing a package with its published `.crate`, or its release commit.
 struct Detection {
     files: Vec<String>,
     /// What the manifest inherits from the workspace and changed, e.g. "dependency `serde`".
     inherited: Vec<String>,
-    /// Commit the published version was packaged from.
+    /// Commit the published version was packaged from, or that set the version.
     sha: Option<String>,
     warnings: Vec<String>,
 }
@@ -169,7 +184,8 @@ struct PackageReport {
     /// Newest version in the registry that is not yanked.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest: Option<String>,
-    /// Commit the published local version was packaged from, from its `.cargo_vcs_info.json`.
+    /// Commit the published local version was packaged from, from its `.cargo_vcs_info.json`. `publish = false`: the
+    /// commit that set the local version.
     #[serde(skip_serializing_if = "Option::is_none")]
     published_sha: Option<String>,
     /// Commits since `published_sha` that touch the package, newest first.
@@ -352,7 +368,20 @@ fn plan(
 ) -> erris::Result<Plan> {
     let selected = ws.select(&args.selection)?;
     let selected_names: BTreeSet<&str> = selected.iter().map(|m| m.name.as_str()).collect();
-    let publishable: Vec<&Member> = ws.members.iter().filter(|m| m.is_publishable()).collect();
+    // Bumped: compared with their registry, or `publish = false` ones (`in_git`) with the commit that set the version.
+    let unversioned: BTreeSet<&str> = ws
+        .members
+        .iter()
+        .filter(|m| !manifests.has_version(&m.manifest_path))
+        .map(|m| m.name.as_str())
+        .collect();
+    let tracked: Vec<&Member> = ws
+        .members
+        .iter()
+        .filter(|m| ws.updates(m) && !unversioned.contains(m.name.as_str()))
+        .collect();
+    let publishable: Vec<&Member> = tracked.iter().copied().filter(|m| m.is_publishable()).collect();
+    let in_git: Vec<&Member> = tracked.iter().copied().filter(|m| !m.is_publishable()).collect();
 
     // Registries are connected up front so lookups can run in parallel.
     let mut registries = Registries::new(&std::env::current_dir()?);
@@ -417,6 +446,12 @@ fn plan(
         }
         published_of.insert(&member.name, versions.all);
     }
+    for member in ws.members.iter().filter(|m| !ws.updates(m)) {
+        status_of.insert(&member.name, Status::Disabled);
+    }
+    for name in &unversioned {
+        status_of.insert(name, Status::Unversioned);
+    }
 
     // A newer release made from this history means the repository doesn't keep the version; one made from a later
     // commit, that the checkout is old. Either way the version here is not what was last released. One made elsewhere
@@ -464,6 +499,28 @@ fn plan(
         }
     }
 
+    let git_states = parallel::map(&in_git, |member| match &repo {
+        Some(repo) => Ok(git_release::state(repo, ws, member)),
+        // Only there for propagation: taken as released.
+        None if !selected_names.contains(member.name.as_str()) => Ok(git_release::State::Committed),
+        None => Err(report!(
+            "{}@{}: `publish = false`, so it is released through git, but {} is not in a git repository: the commit \
+             that set the version can't be found; set `update = false` in [package.metadata.publish-plz] to leave it \
+             alone",
+            member.name,
+            member.version,
+            ws.root.display()
+        )),
+    });
+    for (member, state) in in_git.iter().zip(git_states) {
+        let status = match state? {
+            git_release::State::New => Status::New,
+            git_release::State::Pending => Status::Pending,
+            git_release::State::Committed => Status::Committed,
+        };
+        status_of.insert(&member.name, status);
+    }
+
     let mut ignores: HashMap<&str, Ignore> = HashMap::new();
     for member in &selected {
         let ignore = ignore_for(args, ws, member)?;
@@ -479,7 +536,11 @@ fn plan(
             Target::Exact(version) => format!("--version {version}"),
             other => format!("--bump {}", other.label()),
         };
-        for member in &selected {
+        // `update = false` holds against them too: they are warned about below.
+        for member in selected
+            .iter()
+            .filter(|m| ws.updates(m) && !unversioned.contains(m.name.as_str()))
+        {
             let bump = Bump {
                 target: target.clone(),
                 reason: reason.clone(),
@@ -517,12 +578,44 @@ fn plan(
         }
     }
 
+    let git_to_detect: Vec<&Member> = selected
+        .iter()
+        .copied()
+        .filter(|m| !bumps.contains_key(&m.name) && status_of.get(m.name.as_str()) == Some(&Status::Committed))
+        .collect();
+    if let Some(history) = &mut history
+        && !git_to_detect.is_empty()
+    {
+        let releases = git_releases(ws, manifests, history, &git_to_detect)?;
+        let repo = history.repo;
+        let detections = parallel::map(&releases, |(member, release)| {
+            git_release::changed_files(repo, ws, member, release, ignore_of(member))
+        });
+        for ((member, release), files) in releases.iter().zip(detections) {
+            let files = files?;
+            sha_of.insert(&member.name, release.clone());
+            if files.is_empty() {
+                unchanged.insert(&member.name);
+                continue;
+            }
+            let detection = Detection {
+                files,
+                inherited: Vec::new(),
+                sha: Some(release.clone()),
+                warnings: Vec::new(),
+            };
+            changed.push((member, detection));
+        }
+    }
+
     for member in &selected {
         let id = format!("{}@{}", member.name, member.version);
         match status_of.get(member.name.as_str()) {
             _ if bumps.contains_key(&member.name) => {}
-            Some(Status::New) => eprintln!("{id}: never published, nothing to bump"),
-            Some(Status::Pending) => eprintln!("{id}: not published yet, nothing to bump"),
+            Some(Status::New) if member.is_publishable() => eprintln!("{id}: never published, nothing to bump"),
+            Some(Status::New) => eprintln!("{id}: not committed yet, nothing to bump"),
+            Some(Status::Pending) if member.is_publishable() => eprintln!("{id}: not published yet, nothing to bump"),
+            Some(Status::Pending) => eprintln!("{id}: the version is not committed yet, nothing to bump"),
             Some(Status::NotAllowed) | None => eprintln!("{id}: not published to the selected registry, skipping"),
             Some(Status::Behind) => eprintln!(
                 "{id}: below the newest published {}, released from this history or a later commit of it: the \
@@ -538,8 +631,13 @@ fn plan(
             ),
             // Found while planning, below.
             Some(Status::VersionTaken) => {}
-            Some(Status::Published) if unchanged.contains(member.name.as_str()) => eprintln!("{id}: unchanged"),
-            Some(Status::Published) => {}
+            Some(Status::Published | Status::Committed) if unchanged.contains(member.name.as_str()) => {
+                eprintln!("{id}: unchanged");
+            }
+            Some(Status::Published | Status::Committed) => {}
+            Some(Status::Unversioned) => eprintln!("{id}: no `version` in its manifest, nothing to bump"),
+            // Warned about once planned.
+            Some(Status::Disabled) => {}
         }
     }
 
@@ -599,7 +697,7 @@ fn plan(
     let settled = settle(
         ws,
         manifests,
-        &publishable,
+        &tracked,
         &mut status_of,
         bumps,
         &published_of,
@@ -620,6 +718,29 @@ fn plan(
              newest release; not bumped",
             member.name, member.version
         );
+    }
+
+    // Said for every one selected, and for any other whose requirement on a bumped member is rewritten under it.
+    let disabled = ws
+        .members
+        .iter()
+        .filter(|m| status_of.get(m.name.as_str()) == Some(&Status::Disabled));
+    for member in disabled {
+        let id = format!("{}@{}", member.name, member.version);
+        if let Some(new) = new_versions.get(&member.name) {
+            eprintln!("warning: {id}: `update = false`, but it shares the workspace version, which moves to {new}");
+            continue;
+        }
+        let dep = trigger(manifests, member, &new_versions);
+        match dep {
+            Some(dep) => {
+                eprintln!("warning: {id}: `update = false`, version not bumped although dependency `{dep}` updated");
+            }
+            None if selected_names.contains(member.name.as_str()) => {
+                eprintln!("warning: {id}: `update = false`, version not bumped");
+            }
+            None => {}
+        }
     }
 
     // From a branch that left before the newest release: right for a backport line, a mistake for a branch that is
@@ -672,7 +793,8 @@ fn plan(
     for (member, detection) in &changed {
         detection_of.insert(&member.name, detection);
     }
-    let packages = publishable
+    let packages = ws
+        .members
         .iter()
         .filter(|m| selected_names.contains(m.name.as_str()) || new_versions.contains_key(&m.name))
         .map(|member| {
@@ -706,7 +828,11 @@ fn plan(
                         Some(newest) => format!("{reason}; below the newest published {newest}"),
                         None => reason,
                     })
-                    .or_else(|| taken.get(&member.name).cloned()),
+                    .or_else(|| taken.get(&member.name).cloned())
+                    .or_else(|| {
+                        let disabled = status_of.get(member.name.as_str()) == Some(&Status::Disabled);
+                        disabled.then(|| "`update = false`".to_owned())
+                    }),
             }
         })
         .collect();
@@ -727,7 +853,7 @@ struct Settled {
 fn settle<'a>(
     ws: &'a Workspace,
     manifests: &Manifests,
-    publishable: &[&Member],
+    tracked: &[&Member],
     status_of: &mut HashMap<&'a str, Status>,
     own_bumps: BTreeMap<String, Bump>,
     published_of: &HashMap<&str, Vec<Version>>,
@@ -757,7 +883,7 @@ fn settle<'a>(
         new_versions = propagate(
             ws,
             manifests,
-            publishable,
+            tracked,
             status_of,
             &mut bumps,
             workspace_version.as_ref(),
@@ -768,7 +894,7 @@ fn settle<'a>(
             if version_group.contains(name.as_str()) {
                 // Never-published and pending members keep their status: they are not bumped either way.
                 let moving = version_group.iter().filter(|other| {
-                    new_versions.contains_key(**other) && status_of.get(**other) == Some(&Status::Published)
+                    new_versions.contains_key(**other) && status_of.get(**other).is_some_and(|s| s.is_released())
                 });
                 for other in moving {
                     let why = format!("the next workspace version {version} is already published for `{name}`");
@@ -826,12 +952,12 @@ fn newest_comparable<'a>(local: &Version, live: &'a [Version]) -> Option<&'a Ver
     live.iter().filter(|v| !stable || v.pre.is_empty()).max()
 }
 
-/// The new version of every package: `bumps` plus a patch bump of every published member depending on a bumped
-/// one, transitively. Adds those patch bumps to `bumps`.
+/// The new version of every package: `bumps` plus a patch bump of every released `tracked` member depending on a
+/// bumped one, transitively. Adds those patch bumps to `bumps`.
 fn propagate(
     ws: &Workspace,
     manifests: &Manifests,
-    publishable: &[&Member],
+    tracked: &[&Member],
     status_of: &HashMap<&str, Status>,
     bumps: &mut BTreeMap<String, Bump>,
     workspace_version: Option<&Version>,
@@ -841,11 +967,11 @@ fn propagate(
     while propagating {
         propagating = false;
         new_versions = plan_versions(ws, manifests, bumps, workspace_version);
-        for member in publishable.iter().filter(|m| !new_versions.contains_key(&m.name)) {
+        for member in tracked.iter().filter(|m| !new_versions.contains_key(&m.name)) {
             let Some(dep) = trigger(manifests, member, &new_versions) else {
                 continue;
             };
-            if status_of.get(member.name.as_str()) != Some(&Status::Published) {
+            if !status_of.get(member.name.as_str()).is_some_and(|s| s.is_released()) {
                 continue;
             }
             let bump = Bump {
@@ -1085,22 +1211,83 @@ impl<'a> History<'a> {
         let repo = self.repo;
         let found = parallel::map(shas, |sha| holds(repo, sha));
         let missing = found.iter().filter(|found| !**found).count();
-        if missing == 0 || !self.shallow || self.no_fetch {
+        if missing == 0 {
             return Ok(found);
         }
-        eprintln!("shallow clone: fetching the git history to find {missing} published commit(s)");
+        let deepened = self.deepen(&format!("{missing} published commit(s)"))?;
+        if !deepened {
+            return Ok(found);
+        }
+        let again: Vec<(&str, bool)> = shas.iter().copied().zip(found).collect();
+        Ok(parallel::map(&again, |(sha, found)| *found || holds(repo, sha)))
+    }
+
+    /// Fetches the full history of a shallow clone, unless told not to. Whether it was fetched.
+    fn deepen(&mut self, to_find: &str) -> erris::Result<bool> {
+        if !self.shallow || self.no_fetch {
+            return Ok(false);
+        }
+        eprintln!("shallow clone: fetching the git history to find {to_find}");
         let no_hooks = git::NoHooks::new()?;
-        let status = git::command(repo)
+        let status = git::command(self.repo)
             .args(no_hooks.args())
             .args(["fetch", "--unshallow", "--quiet"])
             .status()?;
         if !status.success() {
             eprintln!("warning: `git fetch --unshallow` failed: {status}");
         }
-        self.shallow = git::is_shallow(repo);
-        let again: Vec<(&str, bool)> = shas.iter().copied().zip(found).collect();
-        Ok(parallel::map(&again, |(sha, found)| *found || holds(repo, sha)))
+        self.shallow = git::is_shallow(self.repo);
+        Ok(true)
     }
+}
+
+/// The commit that set the version of each of `members` (`publish = false`, [`Status::Committed`]). A shallow clone
+/// is deepened once when one of them is cut off; one still cut off then is an error.
+fn git_releases<'a>(
+    ws: &Workspace,
+    manifests: &Manifests,
+    history: &mut History,
+    members: &[&'a Member],
+) -> erris::Result<Vec<(&'a Member, String)>> {
+    let search = |history: &History, members: &[&'a Member]| {
+        let found = parallel::map(members, |member| {
+            let inherits = manifests.inherits_version(&member.manifest_path);
+            git_release::release(history.repo, ws, member, inherits, history.shallow)
+        });
+        found.into_iter().collect::<erris::Result<Vec<_>>>()
+    };
+    let mut found = search(history, members)?;
+    let cut: Vec<&'a Member> = members
+        .iter()
+        .zip(&found)
+        .filter(|(_, release)| **release == Release::Cut)
+        .map(|(member, _)| *member)
+        .collect();
+    if !cut.is_empty() {
+        let deepened = history.deepen(&format!("the commits that set {} version(s)", cut.len()))?;
+        let again = if deepened { search(history, &cut)? } else { Vec::new() };
+        let mut again = again.into_iter();
+        for release in found.iter_mut().filter(|release| **release == Release::Cut) {
+            let retried = again.next();
+            if let Some(retried) = retried {
+                *release = retried;
+            }
+        }
+    }
+    members
+        .iter()
+        .zip(found)
+        .map(|(member, release)| match release {
+            Release::Commit(sha) => Ok((*member, sha)),
+            Release::Cut => Err(report!(
+                "{}@{}: `publish = false`, so it is released through git, but the commit that set the version is \
+                 beyond this shallow clone; fetch the history (`git fetch --unshallow`), or set `update = false` in \
+                 [package.metadata.publish-plz] to leave it alone",
+                member.name,
+                member.version
+            )),
+        })
+        .collect()
 }
 
 /// Strongest conventional-commit change among commits touching the package since `since`,
@@ -1117,7 +1304,8 @@ fn commits_change(
         return Ok(None);
     }
 
-    let package_dir = relative_to(repo, &member.dir);
+    // Don't attribute commits of nested members (e.g. root package of a workspace).
+    let pathspec = Pathspec::of(ws, repo, member);
     let mut cmd = git::command(repo);
     cmd.args([
         "log",
@@ -1126,23 +1314,12 @@ fn commits_change(
         &format!("{since}..HEAD"),
         "--",
     ]);
-    cmd.arg(&package_dir);
-    // Don't attribute commits of nested members (e.g. root package of a workspace).
-    for other in &ws.members {
-        if other.dir != member.dir && other.dir.starts_with(&member.dir) {
-            cmd.arg(format!(":(exclude){}", relative_to(repo, &other.dir).display()));
-        }
-    }
+    cmd.args(&pathspec.args);
     let output = cmd.output()?;
     if !output.status.success() {
         return Err(report!("`git log` failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
-    // `git log` paths are relative to the repository, ignore patterns to the package.
-    let prefix = match package_dir.to_string_lossy().replace('\\', "/").as_str() {
-        "." => String::new(),
-        dir => format!("{dir}/"),
-    };
     let log = String::from_utf8_lossy(&output.stdout);
     let mut change = None;
     let mut found = Vec::new();
@@ -1157,7 +1334,7 @@ fn commits_change(
             .lines()
             .map(str::trim)
             .filter(|f| !f.is_empty())
-            .any(|f| !ignore.is_ignored(f.strip_prefix(&prefix).unwrap_or(f)));
+            .any(|f| !ignore.is_ignored(pathspec.in_package(f)));
         if !relevant {
             continue;
         }
@@ -1169,17 +1346,6 @@ fn commits_change(
     }
     // Files differ but no commits: uncommitted changes or a workspace-level change.
     Ok(Some((change.unwrap_or(Change::Fix), found)))
-}
-
-/// `dir` relative to `repo`, both canonicalized (only for comparing; git is given paths as it prints them).
-fn relative_to(repo: &Path, dir: &Path) -> PathBuf {
-    let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    match dir.strip_prefix(&repo) {
-        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
-        Ok(rel) => rel.to_path_buf(),
-        Err(_) => dir,
-    }
 }
 
 #[cfg(test)]

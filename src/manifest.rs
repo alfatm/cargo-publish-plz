@@ -61,6 +61,12 @@ impl Manifests {
         Ok(())
     }
 
+    /// `package.version` is there, set or inherited: cargo takes `0.0.0` without it.
+    pub fn has_version(&self, manifest: &Path) -> bool {
+        let package = self.docs.get(manifest).and_then(|doc| doc.get("package"));
+        package.and_then(|p| p.get("version")).is_some()
+    }
+
     /// `version.workspace = true`
     pub fn inherits_version(&self, manifest: &Path) -> bool {
         let package = self.docs.get(manifest).and_then(|doc| doc.get("package"));
