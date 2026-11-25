@@ -243,7 +243,9 @@ reports it as `ambiguous-registry`, checks the others and fails. An ambiguous pa
 matters for propagation and is left alone.
 
 Configuration is read like cargo reads it: `CARGO_REGISTRIES_<NAME>_INDEX` / `_TOKEN`, then `.cargo/config.toml`
-(and `.cargo/config`) from the current directory up to the root, then `$CARGO_HOME`. Tokens also come from
+(and `.cargo/config`) from the current directory up to the root, then `$CARGO_HOME`. Each file brings the files
+its `include` lists, relative to it, with cargo's precedence: the file over its includes, a later include over an
+earlier one. Tokens also come from
 `$CARGO_HOME/credentials.toml`. A token is sent only when the registry asks for it: `config.json` answers 401,
 or says `auth-required`.
 

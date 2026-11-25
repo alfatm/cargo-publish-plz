@@ -10,7 +10,7 @@ use erris::prelude::*;
 use erris::report;
 use semver::Version;
 use serde::Deserialize;
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, Item, Value};
 
 const CRATES_IO: &str = "crates-io";
 const CRATES_IO_INDEX: &str = "https://index.crates.io/";
@@ -337,7 +337,7 @@ fn env_key(registry: &str) -> String {
 }
 
 /// Cargo configuration relevant to registries: env vars, `.cargo/config.toml` files
-/// from the workspace up to the filesystem root, then `$CARGO_HOME`.
+/// from the workspace up to the filesystem root, then `$CARGO_HOME`, each with the files it `include`s.
 struct CargoConfig {
     files: Vec<DocumentMut>,
     credentials: Vec<DocumentMut>,
@@ -387,7 +387,7 @@ impl CargoConfig {
             .flat_map(|home| [home.join("credentials.toml"), home.join("credentials")])
             .collect::<Vec<_>>();
         Self {
-            files: read_tomls(&config_paths),
+            files: read_configs(&config_paths),
             credentials: read_tomls(&credential_paths),
         }
     }
@@ -410,17 +410,128 @@ pub fn cargo_home() -> Option<PathBuf> {
 }
 
 fn read_tomls(paths: &[PathBuf]) -> Vec<DocumentMut> {
-    let mut docs = Vec::new();
-    for path in paths {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match text.parse::<DocumentMut>() {
-            Ok(doc) => docs.push(doc),
-            Err(err) => eprintln!("warning: ignoring invalid {}: {err}", path.display()),
+    paths.iter().filter_map(|path| read_toml(path)).collect()
+}
+
+/// `None` for a file that can't be read; an invalid one is also reported.
+fn read_toml(path: &Path) -> Option<DocumentMut> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match text.parse::<DocumentMut>() {
+        Ok(doc) => Some(doc),
+        Err(err) => {
+            eprintln!("warning: ignoring invalid {}: {err}", path.display());
+            None
         }
     }
+}
+
+/// Config files, each followed by the files it `include`s, so the first document that has a key is the one cargo
+/// takes it from: a file overrides its includes, and a later include an earlier one.
+fn read_configs(paths: &[PathBuf]) -> Vec<DocumentMut> {
+    let mut docs = Vec::new();
+    for path in paths {
+        read_config(path, &mut Vec::new(), &mut docs);
+    }
     docs
+}
+
+/// `chain` holds the files that include `path`, to stop at a cycle.
+fn read_config(path: &Path, chain: &mut Vec<PathBuf>, docs: &mut Vec<DocumentMut>) {
+    let Some(doc) = read_toml(path) else {
+        return;
+    };
+    let included = includes(path, &doc);
+    docs.push(doc);
+    // Include paths are relative to the file that includes them.
+    let dir = path.parent().unwrap_or(Path::new(""));
+    chain.push(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()));
+    for Include {
+        path: include,
+        optional,
+    } in included.into_iter().rev()
+    {
+        let file = dir.join(include);
+        let canonical = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if chain.contains(&canonical) {
+            eprintln!("warning: {} includes itself through {}", file.display(), path.display());
+            continue;
+        }
+        if !file.is_file() {
+            if !optional {
+                eprintln!(
+                    "warning: ignoring missing {} included from {}",
+                    file.display(),
+                    path.display()
+                );
+            }
+            continue;
+        }
+        read_config(&file, chain, docs);
+    }
+    chain.pop();
+}
+
+struct Include {
+    path: String,
+    optional: bool,
+}
+
+/// The `include` entries of a config file, in order: a path, a `{ path, optional }` table, or an array of them.
+fn includes(path: &Path, doc: &DocumentMut) -> Vec<Include> {
+    let Some(item) = doc.get("include") else {
+        return Vec::new();
+    };
+    let entries: Vec<Option<Include>> = match item {
+        Item::Value(Value::Array(list)) => list.iter().map(include_value).collect(),
+        Item::Value(value) => vec![include_value(value)],
+        Item::Table(table) => vec![include_table(table.get("path"), table.get("optional"))],
+        Item::ArrayOfTables(tables) => tables
+            .iter()
+            .map(|table| include_table(table.get("path"), table.get("optional")))
+            .collect(),
+        Item::None => Vec::new(),
+    };
+    let valid = entries.len();
+    let entries: Vec<Include> = entries.into_iter().flatten().collect();
+    if entries.len() != valid {
+        eprintln!(
+            "warning: ignoring invalid `include` entries in {}: expected paths or {{ path, optional }} tables",
+            path.display()
+        );
+    }
+    entries
+}
+
+fn include_value(value: &Value) -> Option<Include> {
+    match value {
+        Value::String(path) => Some(Include {
+            path: path.value().clone(),
+            optional: false,
+        }),
+        Value::InlineTable(table) => {
+            let path = table.get("path")?.as_str()?;
+            let optional = table.get("optional").map(Value::as_bool);
+            include_entry(path, optional)
+        }
+        _ => None,
+    }
+}
+
+fn include_table(path: Option<&Item>, optional: Option<&Item>) -> Option<Include> {
+    let path = path?.as_str()?;
+    include_entry(path, optional.map(Item::as_bool))
+}
+
+/// `optional` is `Some(None)` when present but not a boolean.
+fn include_entry(path: &str, optional: Option<Option<bool>>) -> Option<Include> {
+    let optional = match optional {
+        None => false,
+        Some(flag) => flag?,
+    };
+    Some(Include {
+        path: path.to_owned(),
+        optional,
+    })
 }
 
 fn lookup(doc: &DocumentMut, key: &[&str]) -> Option<String> {
@@ -566,6 +677,50 @@ mod tests {
         // `config` is read only without `config.toml` next to it.
         let expected = ["a/b/.cargo/config.toml", "a/.cargo/config", ".cargo/config.toml"];
         assert_eq!(found, expected.map(Path::new));
+        Ok(())
+    }
+
+    #[test]
+    fn includes_follow_cargo_precedence() -> erris::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dir = root.path();
+        std::fs::create_dir_all(dir.join("sub"))?;
+        let files = [
+            (
+                "config.toml",
+                r#"include = ["a.toml", { path = "sub/b.toml" }, { path = "gone.toml", optional = true }]
+                   own = "config""#,
+            ),
+            (
+                "a.toml",
+                r#"own = "a"
+                          a = "a"
+                          ab = "a""#,
+            ),
+            // Relative to `sub`, and a cycle back to the top.
+            (
+                "sub/b.toml",
+                r#"include = ["c.toml", "../config.toml"]
+                              ab = "b"
+                              bc = "b""#,
+            ),
+            (
+                "sub/c.toml",
+                r#"bc = "c"
+                              c = "c""#,
+            ),
+        ];
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text)?;
+        }
+        let docs = read_configs(&[dir.join("config.toml")]);
+        let get = |key: &str| docs.iter().find_map(|doc| lookup(doc, &[key]));
+        assert_eq!(docs.len(), 4);
+        assert_eq!(get("own").as_deref(), Some("config"));
+        assert_eq!(get("a").as_deref(), Some("a"));
+        assert_eq!(get("ab").as_deref(), Some("b"));
+        assert_eq!(get("bc").as_deref(), Some("b"));
+        assert_eq!(get("c").as_deref(), Some("c"));
         Ok(())
     }
 
