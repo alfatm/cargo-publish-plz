@@ -7,6 +7,7 @@ use erris::report;
 use serde::Serialize;
 
 use crate::Format;
+use crate::cargo_home::IsolatedHome;
 use crate::parallel;
 use crate::registry::Registries;
 use crate::update::print_json;
@@ -28,6 +29,9 @@ pub struct PublishArgs {
     /// Don't verify the contents by building them.
     #[arg(long)]
     no_verify: bool,
+    /// Ignore the config in $CARGO_HOME (e.g. a `[source.crates-io]` mirror); credentials are kept.
+    #[arg(long)]
+    ignore_cargo_home: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t)]
     format: Format,
@@ -85,7 +89,8 @@ struct Pending {
 pub fn run(args: &PublishArgs) -> erris::Result<ExitCode> {
     let ws = Workspace::load(&args.selection)?;
     let selected = ws.select(&args.selection)?;
-    let mut registries = Registries::new(&std::env::current_dir()?);
+    let cwd = std::env::current_dir()?;
+    let mut registries = Registries::new(&cwd, args.ignore_cargo_home);
 
     let mut reports = Vec::new();
     let mut targets = Vec::new();
@@ -155,6 +160,11 @@ pub fn run(args: &PublishArgs) -> erris::Result<ExitCode> {
     if batches.is_empty() {
         eprintln!("nothing to publish");
     }
+    let isolated = if args.ignore_cargo_home && !batches.is_empty() {
+        Some(IsolatedHome::new(&cwd)?)
+    } else {
+        None
+    };
     for batch in &batches {
         if args.dry_run && batch.after_earlier {
             eprintln!(
@@ -170,7 +180,7 @@ pub fn run(args: &PublishArgs) -> erris::Result<ExitCode> {
         } else {
             Outcome::Published
         };
-        let mut cmd = crate::cargo();
+        let mut cmd = isolated.as_ref().map_or_else(crate::cargo, IsolatedHome::cargo);
         cmd.arg("publish").arg("--manifest-path").arg(&ws.root_manifest);
         for package in &batch.packages {
             cmd.arg("-p").arg(package);

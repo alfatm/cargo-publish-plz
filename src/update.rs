@@ -384,7 +384,7 @@ fn plan(
     let in_git: Vec<&Member> = tracked.iter().copied().filter(|m| !m.is_publishable()).collect();
 
     // Registries are connected up front so lookups can run in parallel.
-    let mut registries = Registries::new(&std::env::current_dir()?);
+    let mut registries = Registries::new(&std::env::current_dir()?, false);
     let mut registry_of: HashMap<&str, Option<String>> = HashMap::new();
     let mut ambiguous: HashMap<&str, Vec<String>> = HashMap::new();
     for member in &publishable {

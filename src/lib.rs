@@ -3,6 +3,7 @@
 //! The logic lives here so that both binaries, `cargo-publish-plz` (run by cargo as
 //! `cargo publish-plz`) and `publish-plz`, share it.
 
+mod cargo_home;
 mod checkout;
 mod commits;
 mod effective;

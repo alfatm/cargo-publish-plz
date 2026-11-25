@@ -343,18 +343,45 @@ struct CargoConfig {
     credentials: Vec<DocumentMut>,
 }
 
+/// The `.cargo/config.toml` (or `.cargo/config`) files cargo run in `cwd` reads, nearest first. With
+/// `ignore_home`, those of `$CARGO_HOME` are left out, also when it is one of the ancestors of `cwd`.
+pub fn config_files(cwd: &Path, ignore_home: bool) -> Vec<PathBuf> {
+    let cargo_home = cargo_home();
+    let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|dir| dir.join(".cargo")).collect();
+    if let Some(home) = &cargo_home {
+        dirs.push(home.clone());
+    }
+    let mut files = Vec::new();
+    for dir in dirs {
+        let is_home = cargo_home.as_deref().is_some_and(|home| same_dir(home, &dir));
+        if ignore_home && is_home {
+            continue;
+        }
+        // Cargo reads `config` only when there is no `config.toml`.
+        let file = [dir.join("config.toml"), dir.join("config")]
+            .into_iter()
+            .find(|f| f.is_file());
+        let Some(file) = file else {
+            continue;
+        };
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    files
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || std::fs::canonicalize(a)
+            .ok()
+            .is_some_and(|a| std::fs::canonicalize(b).ok() == Some(a))
+}
+
 impl CargoConfig {
-    fn load(cwd: &Path) -> Self {
+    fn load(cwd: &Path, ignore_home: bool) -> Self {
         let cargo_home = cargo_home();
-        let mut config_paths: Vec<PathBuf> = Vec::new();
-        for dir in cwd.ancestors() {
-            config_paths.push(dir.join(".cargo/config.toml"));
-            config_paths.push(dir.join(".cargo/config"));
-        }
-        if let Some(home) = &cargo_home {
-            config_paths.push(home.join("config.toml"));
-            config_paths.push(home.join("config"));
-        }
+        let config_paths = config_files(cwd, ignore_home);
         let credential_paths = cargo_home
             .iter()
             .flat_map(|home| [home.join("credentials.toml"), home.join("credentials")])
@@ -377,7 +404,7 @@ impl CargoConfig {
     }
 }
 
-fn cargo_home() -> Option<PathBuf> {
+pub fn cargo_home() -> Option<PathBuf> {
     let home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
     home.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
 }
@@ -419,10 +446,11 @@ pub struct Registries {
 }
 
 impl Registries {
-    /// Config files are read from the ancestors of `cwd`, as cargo run there would.
-    pub fn new(cwd: &Path) -> Self {
+    /// Config files are read from the ancestors of `cwd`, as cargo run there would; with `ignore_home`,
+    /// not those of `$CARGO_HOME` (its credentials still count).
+    pub fn new(cwd: &Path, ignore_home: bool) -> Self {
         Self {
-            config: CargoConfig::load(cwd),
+            config: CargoConfig::load(cwd, ignore_home),
             registries: HashMap::new(),
         }
     }
@@ -505,7 +533,7 @@ mod tests {
 
     #[test]
     fn registry_choice() {
-        let registries = Registries::new(&std::env::temp_dir());
+        let registries = Registries::new(&std::env::temp_dir(), false);
         let both = ["a".to_owned(), "b".to_owned()];
         let picked = |choice: Choice| match choice {
             Choice::Registry(name) => format!("registry {name}"),
@@ -517,6 +545,28 @@ mod tests {
         assert_eq!(picked(registries.choose(Some("c"), Some(&both))), "not allowed");
         assert_eq!(picked(registries.choose(None, Some(&both[..1]))), "registry a");
         assert!(registries.name_for(None, "x", Some(&both)).is_err());
+    }
+
+    #[test]
+    fn config_files_nearest_first() -> erris::Result<()> {
+        let root = tempfile::tempdir()?;
+        let inner = root.path().join("a/b");
+        for (dir, name) in [
+            ("", "config.toml"),
+            ("a/b", "config.toml"),
+            ("a/b", "config"),
+            ("a", "config"),
+        ] {
+            let dir = root.path().join(dir).join(".cargo");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(name), "")?;
+        }
+        let found = config_files(&inner, false);
+        let found: Vec<_> = found.iter().filter_map(|f| f.strip_prefix(root.path()).ok()).collect();
+        // `config` is read only without `config.toml` next to it.
+        let expected = ["a/b/.cargo/config.toml", "a/.cargo/config", ".cargo/config.toml"];
+        assert_eq!(found, expected.map(Path::new));
+        Ok(())
     }
 
     #[test]

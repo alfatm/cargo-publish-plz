@@ -247,6 +247,26 @@ Configuration is read like cargo reads it: `CARGO_REGISTRIES_<NAME>_INDEX` / `_T
 `$CARGO_HOME/credentials.toml`. A token is sent only when the registry asks for it: `config.json` answers 401,
 or says `auth-required`.
 
+### `publish --ignore-cargo-home`
+
+When the target registry is source-replaced (`[source.crates-io] replace-with = "mirror"`), a multi-package
+`cargo publish` fails. Cargo looks up the crates it packaged earlier in the same call in the replacement index, not
+in its local overlay, so a dependent crate can't find the new version of its dependency. This happens wherever the
+replacement points, even at crates.io itself. Cargo has no way to remove a setting (`--config` only adds or
+overrides), so the flag runs `cargo publish` without the config instead:
+
+- `CARGO_HOME` is a temporary directory. `credentials.toml` is copied into it, and `registry/` and `git/` are
+  linked so dependencies aren't downloaded again.
+- Cargo runs from that directory. Otherwise, for a workspace under `~`, it would still read `~/.cargo/config.toml`
+  as the config of an ancestor directory.
+- The config files of the real current directory, except `$CARGO_HOME`'s, are passed with `--config`, outermost
+  first. Unlike config files, `--config` takes precedence over `CARGO_*` env vars.
+- Unless `RUSTUP_TOOLCHAIN` is set, it is set to the toolchain `rustup show active-toolchain` picks in the real
+  current directory, so a `rust-toolchain.toml` there still applies.
+
+The registry is chosen from the same config, also without `$CARGO_HOME`, so `registry.default` set there doesn't
+apply either.
+
 All registries are connected up front so lookups and downloads can run in parallel.
 
 ## Publishing

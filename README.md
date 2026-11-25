@@ -126,12 +126,19 @@ different registries are split into calls ordered by their dependencies.
 | `--dry-run`              | Perform all checks without uploading                 |
 | `--allow-dirty`          | Allow uncommitted changes                            |
 | `--no-verify`            | Don't build the packages before uploading            |
+| `--ignore-cargo-home`    | Ignore the config in `$CARGO_HOME`, keep credentials |
 | `--format <FORMAT>`      | `human` (default) or `json`                          |
 | `-p, --package <SPEC>`   | Publish only these packages                          |
 | `--workspace`            | Publish all workspace members                        |
 | `--manifest-path <PATH>` | Path to `Cargo.toml`                                 |
 | `--registry <NAME>`      | Only publish packages allowed to go to this registry |
 | `-- <ARGS>...`           | Extra arguments passed to `cargo publish`            |
+
+`--ignore-cargo-home` is for a `$CARGO_HOME` that replaces the target registry with a mirror
+(`[source.crates-io] replace-with = "mirror"`). With a replacement, cargo can't publish several dependent crates in
+one call: it looks for the crates it just packaged in the mirror and fails with `failed to select a version for the
+requirement`. With the flag, `cargo publish` runs with a temporary `CARGO_HOME` that keeps the credentials and
+the download cache but not `config.toml`. The workspace's `.cargo/config.toml` files still apply.
 
 ## Ignored files
 
